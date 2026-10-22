@@ -67,8 +67,18 @@ selection, installation exclusion, probation, healthy commit and failed-update
 filesystem rollback. Two Apple TVs were discovered from copied pairing records,
 and read-only communication succeeded. No live configuration was reset.
 
-Still required: a full signed Sparkle update/relaunch against an installed app,
-physical sleep/reconnection tests, actual IPA signing/installation/renewal and
-cold-login measurement. Fast manual starts do not establish that the reported
-pre-main reboot delay has been fixed. Production release qualification stays off
-until those gates pass. No installed application has been replaced yet.
+Live qualification on October 22 verified a full signed Sparkle update to stable
+build 8 through the permanent feed, healthy relaunch with all 12 app/history records
+preserved, Nuvio download/sign/install and renewals on both TVs, and pairing across
+user-confirmed sleep/wake and a Mac restart. Cold-login startup appeared very fast
+to the user; process launch and first backend-ready response share the same logged
+second. Exact login-to-ready latency was not instrumented. The previous pre-main
+delay's original cause was not established. The sleep test retained connectivity,
+so forced network-outage recovery and destructive live rollback are not claimed.
+
+Normal workflow 39780384671 passed every stage. Qualified detection run
+39782213025 correctly skipped unchanged inputs. The repository qualification
+variable is enabled; the installed app uses the permanent stable feed with no
+candidate override. Failures on incompatible future upstream changes preserve the
+last published release. No paid Developer ID certificate is assumed: bundles use
+ad-hoc code signatures and updates are authenticated by Sparkle Ed25519 signatures.

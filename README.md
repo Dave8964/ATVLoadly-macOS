@@ -1,4 +1,4 @@
-# ATVLoadly for macOS — release qualification in progress
+# ATVLoadly for macOS
 
 Native Apple Silicon integration for [bitxeno/atvloadly](https://github.com/bitxeno/atvloadly).
 Verified base: **v0.7.3**. Requires macOS 13 or newer.
@@ -14,8 +14,9 @@ of all current app records and pairing data, Nuvio installation and renewal on t
 Apple TVs, and startup after a real Mac restart. The backend answered ready in the
 same logged second as process launch; exact login-to-ready latency was not measured.
 Rollback is covered by isolated filesystem tests; destructive live rollback has
-not been forced. The permanent stable feed remains gated until the full normal
-publication workflow passes. Existing installations require explicit cutover approval.
+not been forced. The full normal build/sign/publish workflow passed, and stable build 8 was
+installed through the permanent feed with a healthy commit. Future compatible
+upstream releases publish automatically. Existing installations require explicit cutover approval.
 
 Build on an Apple Silicon Mac with Command Line Tools, Go 1.26.6, Node/npm and
 Rust 1.97.1:
