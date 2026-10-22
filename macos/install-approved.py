@@ -97,6 +97,7 @@ try:
    stored=backup/(label+'.plist');shutil.move(plist,stored);saved_agents.append((stored,plist))
  if target.exists():target.rename(old_sibling)
  new_sibling.rename(target);app_swapped=True
+ run(['/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister','-f',str(target)])
  run(['/usr/bin/open',str(target)])
  deadline=time.monotonic()+20;healthy=False
  while time.monotonic()<deadline:

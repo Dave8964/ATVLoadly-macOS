@@ -2,8 +2,11 @@ import Cocoa
 import ServiceManagement
 import Sparkle
 
-final class Controller: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
+final class Controller: NSObject, NSApplicationDelegate, NSWindowDelegate, SPUUpdaterDelegate {
     private var status: NSStatusItem!
+    private var controlsWindow: NSWindow?
+    private let controlState = NSTextField(labelWithString: "Starting…")
+    private let controlVersion = NSTextField(labelWithString: "Latest version: not checked")
     private let state = NSMenuItem(title: "Starting…", action: nil, keyEquivalent: "")
     private let latest = NSMenuItem(title: "Latest Available Version: not checked", action: nil, keyEquivalent: "")
     private var updater: SPUStandardUpdaterController?
@@ -25,6 +28,7 @@ final class Controller: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         status.button?.image = NSImage(systemSymbolName: "appletv", accessibilityDescription: "ATVLoadly")
         let menu = NSMenu()
         menu.addItem(state)
+        add(menu, "Show Controls…", #selector(showControls))
         add(menu, "Open Dashboard", #selector(dashboard))
         add(menu, "View Logs", #selector(logs))
         menu.addItem(.separator())
@@ -59,9 +63,47 @@ final class Controller: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         }
         loginItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
         if SMAppService.mainApp.status == .requiresApproval { loginItem?.title = "Start at Login — approval required" }
+        if !UserDefaults.standard.bool(forKey: "ATVControlsWindowPresented") {
+            showControls()
+            UserDefaults.standard.set(true, forKey: "ATVControlsWindowPresented")
+        }
         poll()
         timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.poll() }
     }
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showControls()
+        return true
+    }
+    @objc private func showControls() {
+        if controlsWindow == nil {
+            let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 450, height: 270), styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+            window.title = "ATVLoadly"
+            window.delegate = self
+            window.isReleasedWhenClosed = false
+            let title = NSTextField(labelWithString: "ATVLoadly " + (Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""))
+            title.font = .boldSystemFont(ofSize: 20)
+            let hint = NSTextField(wrappingLabelWithString: "ATVLoadly runs in the menu bar. You can also use this window to open your dashboard or install app updates.")
+            let dashboardButton = NSButton(title: "Open Dashboard", target: self, action: #selector(dashboard))
+            let updateButton = NSButton(title: "Check for Updates…", target: self, action: #selector(check))
+            let logsButton = NSButton(title: "View Logs", target: self, action: #selector(logs))
+            let buttons = NSStackView(views: [dashboardButton, updateButton, logsButton])
+            buttons.orientation = .horizontal
+            buttons.spacing = 10
+            let stack = NSStackView(views: [title, hint, controlState, controlVersion, buttons])
+            stack.orientation = .vertical
+            stack.alignment = .leading
+            stack.spacing = 16
+            stack.translatesAutoresizingMaskIntoConstraints = false
+            window.contentView!.addSubview(stack)
+            NSLayoutConstraint.activate([stack.leadingAnchor.constraint(equalTo: window.contentView!.leadingAnchor, constant: 24), stack.trailingAnchor.constraint(equalTo: window.contentView!.trailingAnchor, constant: -24), stack.topAnchor.constraint(equalTo: window.contentView!.topAnchor, constant: 24)])
+            window.center()
+            controlsWindow = window
+        }
+        NSApp.setActivationPolicy(.regular)
+        controlsWindow?.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+    func windowWillClose(_ notification: Notification) { NSApp.setActivationPolicy(.accessory) }
     @discardableResult private func add(_ menu: NSMenu, _ title: String, _ action: Selector) -> NSMenuItem {
         let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
         item.target = self; menu.addItem(item); return item
@@ -102,7 +144,7 @@ final class Controller: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         URLSession.shared.dataTask(with: request) { data, response, _ in
             let json = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String:Any] }
             let probation = json?["probation"] as? Bool == true
-            DispatchQueue.main.async { self.state.title = (response as? HTTPURLResponse)?.statusCode == 200 ? (probation ? "Validating update — refresh jobs paused" : "Backend ready") : "Replacement backend offline" }
+            DispatchQueue.main.async { self.state.title = (response as? HTTPURLResponse)?.statusCode == 200 ? (probation ? "Validating update — refresh jobs paused" : "Backend ready") : "Replacement backend offline"; self.controlState.stringValue = self.state.title }
         }.resume()
     }
     private func show(_ title: String, _ text: String) { let a = NSAlert(); a.messageText = title; a.informativeText = text; a.runModal() }
@@ -117,7 +159,7 @@ final class Controller: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     @objc private func notes() { NSWorkspace.shared.open(releaseNotesURL ?? URL(string: "https://github.com/bitxeno/atvloadly/releases")!) }
     @objc private func login(_ sender: NSMenuItem) { if SMAppService.mainApp.status == .requiresApproval { SMAppService.openSystemSettingsLoginItems(); return }; do { if SMAppService.mainApp.status == .enabled {try SMAppService.mainApp.unregister()} else {try SMAppService.mainApp.register()}; sender.state = SMAppService.mainApp.status == .enabled ? .on : .off } catch {show("Login startup",error.localizedDescription)} }
     @objc private func quit() { NSApp.terminate(nil) }
-    func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) { latest.title = "Latest Available Version: \(item.displayVersionString) (build \(item.versionString))"; releaseNotesURL = item.releaseNotesURL; status.button?.title = "↑" }
+    func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) { latest.title = "Latest Available Version: \(item.displayVersionString) (build \(item.versionString))"; controlVersion.stringValue = "Latest version: \(item.displayVersionString) (build \(item.versionString))"; releaseNotesURL = item.releaseNotesURL; status.button?.title = "↑" }
     func updater(_ updater: SPUUpdater, willInstallUpdate item: SUAppcastItem) { updateTarget = item }
     func updater(_ updater: SPUUpdater, willInstallUpdateOnQuit item: SUAppcastItem, immediateInstallationBlock: @escaping () -> Void) -> Bool {
         updateTarget = item
