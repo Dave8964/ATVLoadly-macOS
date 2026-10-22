@@ -9,11 +9,13 @@ signed manifests and archives, excludes active installations/pairing/login sessi
 backs up the stopped application's data, validates the replacement in probation,
 and restores the prior application/data after failed health checks.
 
-**This distribution is still a test candidate.** Filesystem rollback and healthy
-commit tests pass, but a complete Sparkle old-to-new installation, actual IPA
-installation/renewal and cold-login startup still need qualification. Existing
-installations must not be overwritten without explicit approval. No production
-update feed is published until the qualification gate is enabled.
+Live qualification has verified a signed Sparkle replacement/relaunch, preservation
+of all current app records and pairing data, Nuvio installation and renewal on two
+Apple TVs, and startup after a real Mac restart. The backend answered ready in the
+same logged second as process launch; exact login-to-ready latency was not measured.
+Rollback is covered by isolated filesystem tests; destructive live rollback has
+not been forced. The permanent stable feed remains gated until the full normal
+publication workflow passes. Existing installations require explicit cutover approval.
 
 Build on an Apple Silicon Mac with Command Line Tools, Go 1.26.6, Node/npm and
 Rust 1.97.1:
