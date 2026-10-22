@@ -10,7 +10,9 @@ and output are excluded from Git.
 The menu app installs a direct-executable user launch agent at
 `~/Library/LaunchAgents/local.atvloadly.native.backend.plist`. It preserves an
 existing `local.atvloadly.agent` service and will not silently take over its live
-database. Login startup uses SMAppService. Service data lives in
+database. Login startup uses SMAppService. The agent declares the main app in
+`AssociatedBundleIdentifiers` so macOS can attribute Local Network permission
+to it, following Apple TN3179. Service data lives in
 `~/Library/Application Support/ATVLoadly/data`; pairing data retains upstream's
 `~/.config/PlumeImpactor` and lockdown locations. The initial transition from an
 existing installation requires an approved final backup and service cutover.
