@@ -1,0 +1,96 @@
+name: Retry verified macOS publication
+on:
+  workflow_dispatch:
+    inputs:
+      build_run_id:
+        description: Completed macOS build workflow run ID
+        required: true
+        type: string
+      draft_release_id:
+        description: Existing private candidate release ID
+        required: true
+        type: string
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: macos-upstream-release
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: macos-15
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate trusted successful build and matching private draft
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUILD_RUN: ${{ inputs.build_run_id }}
+          DRAFT_RELEASE: ${{ inputs.draft_release_id }}
+        run: |
+          python3 - <<'PY'
+          import json,os,pathlib,re,subprocess,time
+          repo=os.environ['GITHUB_REPOSITORY'];run_id=os.environ['BUILD_RUN'];release_id=os.environ['DRAFT_RELEASE']
+          if not run_id.isdigit() or not release_id.isdigit():raise ValueError('Numeric run and draft IDs required')
+          def get(path):return json.loads(subprocess.check_output(['gh','api',path],text=True))
+          run=get(f'repos/{repo}/actions/runs/{run_id}')
+          if run['head_repository']['full_name']!=repo or run['path']!='.github/workflows/macos-candidate.yml' or run['event'] not in ('workflow_dispatch','schedule'):
+              raise ValueError('Only this repository’s trusted macOS workflow can supply artifacts')
+          jobs=get(f'repos/{repo}/actions/runs/{run_id}/jobs?per_page=100')['jobs']
+          if not any(j['name']=='build' and j['conclusion']=='success' for j in jobs):raise ValueError('Build did not pass')
+          sha=run['head_sha']
+          if not re.fullmatch(r'[0-9a-f]{40}',sha):raise ValueError('Invalid source SHA')
+          for attempt in range(6):
+              try:
+                  release=get(f'repos/{repo}/releases/{release_id}')
+                  break
+              except subprocess.CalledProcessError:
+                  if attempt==5:raise
+                  time.sleep(2**attempt)
+          tag=release['tag_name']
+          if not release['draft'] or not re.fullmatch(r'macos-v[0-9]+\.[0-9]+\.[0-9]+-candidate\.'+str(run['run_number']),tag) or release['target_commitish']!=sha:
+              raise ValueError('Draft does not match the tested source/build number')
+          with open(os.environ['GITHUB_OUTPUT'],'a') as f:f.write(f'sha={sha}\ntag={tag}\n')
+          print('Validated successful native build and exact candidate source:',sha)
+          PY
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-build
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+          path: signed-release
+      - uses: actions/download-artifact@v4
+        with:
+          name: upstream-notes
+          run-id: ${{ inputs.build_run_id }}
+          github-token: ${{ github.token }}
+          path: signed-release
+      - name: Verify artifact provenance and archive checksum
+        env:
+          RELEASE_SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        run: |
+          python3 - <<'PY'
+          import hashlib,os,pathlib
+          root=pathlib.Path('signed-release')
+          if 'Integration-Commit: '+os.environ['RELEASE_SOURCE_SHA'] not in (root/'upstream-notes.md').read_text():raise ValueError('Artifact provenance mismatch')
+          for line in (root/'SHA256SUMS').read_text().splitlines():
+              digest,name=line.split(None,1);file=root/pathlib.Path(name.strip()).name
+              if not file.is_file() or hashlib.sha256(file.read_bytes()).hexdigest()!=digest:raise ValueError('Archive checksum mismatch')
+          PY
+      - name: Sign verified candidate
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          QUALIFIED_RELEASES: 'false'
+          RELEASE_TAG: ${{ steps.source.outputs.tag }}
+        run: ./macos/sign-candidate.sh "$PWD/signed-release" "$RELEASE_TAG"
+      - name: Publish verified assets by release ID
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          RELEASE_TAG: ${{ steps.source.outputs.tag }}
+          EXISTING_RELEASE_ID: ${{ inputs.draft_release_id }}
+          QUALIFIED_RELEASES: 'false'
+        run: python3 macos/publish-release.py "$RELEASE_TAG" "$PWD/signed-release"
