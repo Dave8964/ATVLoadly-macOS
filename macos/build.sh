@@ -23,11 +23,13 @@ fi
 printf '%s  %s\n' c2bf58aa8387266ac179357b1415d6f2635f044da8be41042af32425dae6da0c "$BUILD/Sparkle.tar.xz" | shasum -a 256 -c -
 mkdir -p "$SPARKLE"
 tar -xf "$BUILD/Sparkle.tar.xz" -C "$SPARKLE"
-(cd web/static && npm ci && npm test && npm run build)
+(cd web/static && npm ci --no-audit --no-fund && npm test && npm run build)
 go test ./...
+go test -race ./internal/nativeupdate ./internal/task ./web
 (cd "$BUILD/PlumeImpactor" && cargo build --locked --release -p plumesign)
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/bin" "$APP/Contents/Frameworks"
-CGO_ENABLED=1 go build -trimpath -ldflags "-X github.com/bitxeno/atvloadly/internal/app/build.Version=$VERSION -X github.com/bitxeno/atvloadly/internal/app/build.Commit=$(git rev-parse HEAD) -X github.com/bitxeno/atvloadly/internal/app/build.Mode=production" -o "$APP/Contents/Resources/bin/atvloadly" .
+MACOSX_DEPLOYMENT_TARGET=13.0 CGO_CFLAGS="-mmacosx-version-min=13.0" CGO_LDFLAGS="-mmacosx-version-min=13.0" GOOS=darwin GOARCH=arm64 CGO_ENABLED=1 go build -trimpath -ldflags "-X github.com/bitxeno/atvloadly/internal/app/build.Version=$VERSION -X github.com/bitxeno/atvloadly/internal/app/build.Commit=$(git rev-parse HEAD) -X github.com/bitxeno/atvloadly/internal/app/build.Mode=production" -o "$APP/Contents/Resources/bin/atvloadly" .
+(cd macos/update-agent && go test -race ./... && go build -trimpath -o "$APP/Contents/Resources/bin/update-agent" .)
 cp "$BUILD/PlumeImpactor/target/release/plumesign" "$APP/Contents/Resources/bin/"
 ditto "$SPARKLE/Sparkle.framework" "$APP/Contents/Frameworks/Sparkle.framework"
 swiftc -O -target arm64-apple-macos13 -module-cache-path "$BUILD/swift-cache" -F "$SPARKLE" -framework Cocoa -framework ServiceManagement -framework Sparkle -Xlinker -rpath -Xlinker @executable_path/../Frameworks macos/ATVLoadly.swift -o "$APP/Contents/MacOS/ATVLoadly"
@@ -42,8 +44,11 @@ python3 macos/info.py
 xattr -cr "$APP"
 codesign --force --sign - "$APP/Contents/Resources/bin/atvloadly"
 codesign --force --sign - "$APP/Contents/Resources/bin/plumesign"
+codesign --force --sign - "$APP/Contents/Resources/bin/update-agent"
 codesign --force --sign - "$APP"
 codesign --verify --deep --strict "$APP"
+for executable in "$APP/Contents/MacOS/ATVLoadly" "$APP/Contents/Resources/bin/atvloadly" "$APP/Contents/Resources/bin/plumesign" "$APP/Contents/Resources/bin/update-agent"; do lipo -verify_arch arm64 "$executable"; done
+python3 macos/smoke.py "$APP"
 file "$APP/Contents/Resources/bin/atvloadly" "$APP/Contents/Resources/bin/plumesign" "$APP/Contents/MacOS/ATVLoadly"
 ditto -c -k --sequesterRsrc --keepParent "$APP" "$OUT/ATVLoadly-${VERSION}-macos-arm64.zip"
 shasum -a 256 "$OUT/ATVLoadly-${VERSION}-macos-arm64.zip" > "$OUT/SHA256SUMS"

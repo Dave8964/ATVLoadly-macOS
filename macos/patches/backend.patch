@@ -1,8 +1,262 @@
+diff --git a/cmd/server/server.go b/cmd/server/server.go
+index 3afc8df..6da7481 100644
+--- a/cmd/server/server.go
++++ b/cmd/server/server.go
+@@ -6,6 +6,7 @@ import (
+ 	"github.com/bitxeno/atvloadly/internal/app"
+ 	"github.com/bitxeno/atvloadly/internal/log"
+ 	"github.com/bitxeno/atvloadly/internal/manager"
++	"github.com/bitxeno/atvloadly/internal/nativeupdate"
+ 	"github.com/bitxeno/atvloadly/internal/secret"
+ 	"github.com/bitxeno/atvloadly/internal/service"
+ 	"github.com/bitxeno/atvloadly/internal/signing"
+@@ -92,9 +93,25 @@ func action(c *cli.Context) error {
+ 		log.Err(err).Msg("Failed to remove stale staged files")
+ 	}
+ 
+-	// start jobs
+-	_ = task.ScheduleRefreshApps()
+-	manager.StartDeviceManager()
++	startJobs := func() error {
++		if err := task.ScheduleRefreshApps(); err != nil {
++			return err
++		}
++		manager.StartDeviceManager()
++		return nil
++	}
++	if err := nativeupdate.Initialize(conf.Server.DataDir, startJobs); err != nil {
++		return err
++	}
++	if nativeupdate.Probation() {
++		if err := nativeupdate.Recover(); err != nil {
++			return err
++		}
++	} else {
++		if err := startJobs(); err != nil {
++			return err
++		}
++	}
+ 
+ 	printVersion()
+ 	port := conf.Server.Port
+diff --git a/internal/app/settings.go b/internal/app/settings.go
+index abe1c10..839322a 100644
+--- a/internal/app/settings.go
++++ b/internal/app/settings.go
+@@ -4,7 +4,9 @@ import (
+ 	"math"
+ 	"net/url"
+ 	"os"
++	"path/filepath"
+ 	"strings"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/bitxeno/atvloadly/internal/log"
+@@ -15,6 +17,8 @@ var (
+ 	Settings *SettingsConfiguration
+ )
+ var saveTimer *time.Timer = time.NewTimer(math.MaxInt64)
++var settingsSaveMu sync.Mutex
++var settingsFilePath string
+ 
+ const (
+ 	OneDayAgoMode TaskMode = "1"
+@@ -149,6 +153,7 @@ func printRedactedSettings() {
+ }
+ 
+ func startSaveSettingsJob(settingsPath string) {
++	settingsFilePath = settingsPath
+ 	go func() {
+ 		for {
+ 			<-saveTimer.C
+@@ -159,8 +164,7 @@ func startSaveSettingsJob(settingsPath string) {
+ 				continue
+ 			}
+ 
+-			data := utils.ToIndentJSON(Settings)
+-			if err := os.WriteFile(settingsPath, data, os.ModePerm); err != nil {
++			if err := flushSettingsTo(settingsPath); err != nil {
+ 				log.Err(err).Msg("Save settings error.")
+ 			} else {
+ 				log.Infof("Save settings success. %s", settingsPath)
+@@ -168,3 +172,22 @@ func startSaveSettingsJob(settingsPath string) {
+ 		}
+ 	}()
+ }
++
++func flushSettingsTo(path string) error {
++	settingsSaveMu.Lock()
++	defer settingsSaveMu.Unlock()
++	data := utils.ToIndentJSON(Settings)
++	if err := os.WriteFile(path+".tmp", []byte(data), 0600); err != nil {
++		return err
++	}
++	return os.Rename(path+".tmp", path)
++}
++
++// FlushSettings persists pending settings before a supervised shutdown.
++func FlushSettings() error {
++	path := settingsFilePath
++	if path == "" {
++		path = filepath.Join(Config.Server.DataDir, "settings.json")
++	}
++	return flushSettingsTo(path)
++}
+diff --git a/internal/manager/device_manager.go b/internal/manager/device_manager.go
+index 147c8ab..7e53619 100644
+--- a/internal/manager/device_manager.go
++++ b/internal/manager/device_manager.go
+@@ -217,13 +217,19 @@ func (dm *DeviceManager) checkRemotePairingAsync(ctx context.Context, identifier
+ 		device.ParseDeviceClass()
+ 	}
+ 
++	_, wasConnected := dm.GetDeviceByUDID(device.UDID)
+ 	// remove old lockdown connection device, avoid duplicate devices with both lockdown and remote connection
+ 	removeLockdownDevice(device.UDID)
+ 	dm.DeleteDeviceByUDID(device.UDID)
+ 	dm.SaveDevice(device)
+ 
+-	// Trigger device connection callback
+-	dm.onDeviceConnected(device)
++	// Only a real connection transition triggers refresh work.
++	if !wasConnected {
++		dm.mu.Lock()
++		callback := dm.onDeviceConnected
++		dm.mu.Unlock()
++		callback(device)
++	}
+ }
+ 
+ func (dm *DeviceManager) GetDevices() []model.Device {
 diff --git a/internal/manager/device_manager_mdns.go b/internal/manager/device_manager_mdns.go
-index 4a69d7e..63ec057 100644
+index 4a69d7e..f7da954 100644
 --- a/internal/manager/device_manager_mdns.go
 +++ b/internal/manager/device_manager_mdns.go
-@@ -59,8 +59,7 @@ func (dm *DeviceManager) Start() {
+@@ -6,6 +6,7 @@ import (
+ 	"context"
+ 	"net"
+ 	"net/netip"
++	"sort"
+ 	"strings"
+ 	"sync"
+ 	"time"
+@@ -32,35 +33,105 @@ type discoveredServiceType struct {
+ 	domain      string
+ }
+ 
++func networkFingerprint() string {
++	interfaces, err := net.Interfaces()
++	if err != nil {
++		return "unavailable"
++	}
++	var entries []string
++	for _, iface := range interfaces {
++		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagMulticast == 0 || iface.Flags&net.FlagLoopback != 0 {
++			continue
++		}
++		addresses, err := iface.Addrs()
++		if err != nil {
++			continue
++		}
++		for _, address := range addresses {
++			prefix, err := netip.ParsePrefix(address.String())
++			if err == nil && isLanAddr(prefix.Addr()) {
++				entries = append(entries, iface.Name+":"+address.String())
++			}
++		}
++	}
++	sort.Strings(entries)
++	return strings.Join(entries, ";")
++}
++
++func discoveryNeedsRestart(previous, current string, last, currentTime time.Time) bool {
++	return previous != current || currentTime.UnixNano()-last.UnixNano() > int64(45*time.Second)
++}
++
++func (dm *DeviceManager) resetDiscoveryConnections() {
++	dm.pairingMu.Lock()
++	for _, check := range dm.pairingCancel {
++		check.cancel()
++	}
++	dm.pairingCancel = make(map[string]*pairingCheck)
++	dm.pairingCheckedAt = make(map[string]time.Time)
++	dm.remotePairingServices = make(map[string]string)
++	dm.pairingMu.Unlock()
++	dm.devices.Range(func(k, v any) bool { dm.devices.Delete(k); return true })
++}
++
+ func (dm *DeviceManager) Start() {
+ 	dm.mu.Lock()
++	if dm.cancel != nil {
++		dm.cancel()
++	}
+ 	dm.ctx, dm.cancel = context.WithCancel(context.Background())
+ 	ctx := dm.ctx
+ 	dm.mu.Unlock()
+-
+-	client, err := zeroconf.New().
+-		Browse(dm.handleMDNSEvent,
+-			zeroconf.NewType(mdnsServiceAppleMobdev2),
+-			zeroconf.NewType(mdnsServiceRemotePairing),
+-			zeroconf.NewType(mdnsServiceRemoteManualPairing),
+-		).
+-		Open()
+-	if err != nil {
+-		log.Err(err).Msg("Failed to initialize mDNS browser")
+-		return
+-	}
+-
+-	log.Info("mDNS discovery started...")
+-	<-ctx.Done()
+-	if err := client.Close(); err != nil {
+-		log.Err(err).Msg("Failed to close mDNS browser")
++	ticker := time.NewTicker(15 * time.Second)
++	defer ticker.Stop()
++	for ctx.Err() == nil {
++		browserCtx, cancelBrowser := context.WithCancel(ctx)
++		client, err := zeroconf.New().Browse(func(e zeroconf.Event) {
++			if browserCtx.Err() == nil {
++				dm.handleMDNSEvent(e)
++			}
++		},
++			zeroconf.NewType(mdnsServiceAppleMobdev2), zeroconf.NewType(mdnsServiceRemotePairing), zeroconf.NewType(mdnsServiceRemoteManualPairing)).Open()
++		if err != nil {
++			cancelBrowser()
++			log.Err(err).Msg("Failed to initialize mDNS browser; retrying")
++			select {
++			case <-ctx.Done():
++				return
++			case <-time.After(5 * time.Second):
++				continue
++			}
++		}
++		fingerprint := networkFingerprint()
++		last := time.Now()
++		log.Info("mDNS discovery started")
++		restart := false
++		for !restart && ctx.Err() == nil {
++			select {
++			case <-ctx.Done():
++			case <-ticker.C:
++				now := time.Now()
++				current := networkFingerprint()
++				if discoveryNeedsRestart(fingerprint, current, last, now) {
++					restart = true
++				}
++				last = now
++			}
++		}
++		cancelBrowser()
++		if err := client.Close(); err != nil {
++			log.Err(err).Msg("Failed to close mDNS browser")
++		}
++		if restart && ctx.Err() == nil {
++			dm.resetDiscoveryConnections()
++			log.Info("Network changed or Mac resumed; rebuilding mDNS discovery")
++		}
+ 	}
+ 	log.Info("mDNS discovery stopped")
  }
  
  func (dm *DeviceManager) handleMDNSEvent(e zeroconf.Event) {
@@ -12,7 +266,7 @@ index 4a69d7e..63ec057 100644
  		return
  	}
  
-@@ -81,7 +80,7 @@ func (dm *DeviceManager) handleMDNSEvent(e zeroconf.Event) {
+@@ -81,7 +152,7 @@ func (dm *DeviceManager) handleMDNSEvent(e zeroconf.Event) {
  	}
  
  	host := dm.parseName(e.Hostname)
@@ -21,22 +275,276 @@ index 4a69d7e..63ec057 100644
  
  	switch serviceType {
  	case mdnsServiceAppleMobdev2:
+@@ -136,7 +207,10 @@ func (dm *DeviceManager) handleMDNSEvent(e zeroconf.Event) {
+ 		// Run the slow pairing check off the event loop: the loop stays
+ 		// responsive under event bursts, and a Remove event can cancel the
+ 		// check (killing the plumesign subprocess) to release the goroutine.
+-		go dm.checkRemotePairingAsync(dm.ctx, identifier, authTag, serviceName, host, ip, e.Port)
++		dm.mu.Lock()
++		pairingCtx := dm.ctx
++		dm.mu.Unlock()
++		go dm.checkRemotePairingAsync(pairingCtx, identifier, authTag, serviceName, host, ip, e.Port)
+ 	case mdnsServiceRemoteManualPairing:
+ 		name := serviceName
+ 		if txtName := dm.parseTextRecordName(e.Text); txtName != "" {
+diff --git a/internal/manager/install_manager.go b/internal/manager/install_manager.go
+index e75502b..c745615 100644
+--- a/internal/manager/install_manager.go
++++ b/internal/manager/install_manager.go
+@@ -16,6 +16,7 @@ import (
+ 	execx "github.com/bitxeno/atvloadly/internal/exec"
+ 	"github.com/bitxeno/atvloadly/internal/log"
+ 	"github.com/bitxeno/atvloadly/internal/model"
++	"github.com/bitxeno/atvloadly/internal/signing"
+ 	"github.com/bitxeno/atvloadly/internal/utils"
+ 	"github.com/gookit/event"
+ )
+@@ -155,7 +156,7 @@ func (t *InstallManager) startAppleID(ctx context.Context, opts InstallOptions)
+ 	}()
+ 
+ 	if err := CheckAfcServiceStatus(opts.UDID); err != nil {
+-		return fmt.Errorf("afc service not available: %w", err)
++		return signing.Wrap(signing.ClassTransport, signing.CodeDeviceUnreachable, err, "afc service not available")
+ 	}
+ 
+ 	args := buildInstallArgs(opts, provisionPath)
+@@ -178,6 +179,9 @@ func (t *InstallManager) startAppleID(ctx context.Context, opts InstallOptions)
+ 	}()
+ 
+ 	if err := t.runEngine(ctx, args, app.Config.Server.DataDir, runEnv, stdinReader); err != nil {
++		if strings.Contains(t.outputStdout.String(), engineMarkerInstalling) {
++			return signing.Wrap(signing.ClassTransport, signing.CodeTransportFailed, err, "installation connection failed")
++		}
+ 		return err
+ 	}
+ 
+diff --git a/internal/task/task.go b/internal/task/task.go
+index 8f8678e..e0a7ed0 100644
+--- a/internal/task/task.go
++++ b/internal/task/task.go
+@@ -15,6 +15,7 @@ import (
+ 	"github.com/bitxeno/atvloadly/internal/log"
+ 	"github.com/bitxeno/atvloadly/internal/manager"
+ 	"github.com/bitxeno/atvloadly/internal/model"
++	"github.com/bitxeno/atvloadly/internal/nativeupdate"
+ 	"github.com/bitxeno/atvloadly/internal/notify"
+ 	"github.com/bitxeno/atvloadly/internal/service"
+ 	"github.com/bitxeno/atvloadly/internal/signing"
+@@ -233,6 +234,11 @@ func (t *Task) StartInstallApps(apps []model.InstalledApp, notify bool) int {
+ }
+ 
+ func (t *Task) startInstallApps(apps []model.InstalledApp, notify bool, reinstall bool) int {
++	release, err := nativeupdate.Operations.Enter()
++	if err != nil {
++		return 0
++	}
++	defer release()
+ 	t.resetInvalidAccounts()
+ 
+ 	if len(apps) == 0 {
+@@ -337,6 +343,12 @@ func (t *Task) runQueue() {
+ }
+ 
+ func (t *Task) tryInstallApp(item TaskItem) {
++	release, err := nativeupdate.Operations.Enter()
++	if err != nil {
++		t.handleInstallFailure(item, item.App, err)
++		return
++	}
++	defer release()
+ 	// Decide before resolveIPA replaces a remote IpaPath with the downloaded file.
+ 	refresh := shouldUseRefreshMode(item.App, item.Reinstall)
+ 	update := isSourceUpdate(item.App)
+@@ -425,6 +437,13 @@ func (t *Task) tryInstallApp(item TaskItem) {
+ 	t.trackBatchProgress(item, success, err)
+ }
+ 
++func failedSourceBuildID(buildID string, err error) string {
++	if service.RefreshedErrorOf(err) == model.RefreshedErrorTransport || errors.Is(err, context.DeadlineExceeded) {
++		return ""
++	}
++	return buildID
++}
++
+ func (t *Task) handleInstallFailure(item TaskItem, v model.InstalledApp, err error) {
+ 	log.Err(err).Msgf("Installing ipa failed: %s", v.IpaName)
+ 	v.RefreshedResult = false
+@@ -432,7 +451,7 @@ func (t *Task) handleInstallFailure(item TaskItem, v model.InstalledApp, err err
+ 	if isSourceUpdate(item.App) {
+ 		// The installed app is unchanged: only remember the failed build, and
+ 		// an invalid account so that refreshes skip it.
+-		if markErr := service.MarkSourceUpdateFailed(item.App.ID, item.App.Source.BuildID, err.Error()); markErr != nil {
++		if markErr := service.MarkSourceUpdateFailed(item.App.ID, failedSourceBuildID(item.App.Source.BuildID, err), err.Error()); markErr != nil {
+ 			log.Err(markErr).Msgf("Save update failure failed: %s", v.IpaName)
+ 		}
+ 		if v.RefreshedError == model.RefreshedErrorInvalidAccount {
+@@ -594,7 +613,7 @@ func (t *Task) runInternal(v model.InstalledApp, refresh bool, installMgr *manag
+ 
+ 	dev, found := manager.GetDeviceByUDID(v.UDID)
+ 	if !found || dev == nil {
+-		return nil, fmt.Errorf("device not found for UDID: %s", v.UDID)
++		return nil, signing.Errorf(signing.ClassTransport, signing.CodeDeviceUnreachable, "device not found for UDID: %s", v.UDID)
+ 	}
+ 
+ 	err := installMgr.TryStart(context.Background(), manager.InstallOptions{
+@@ -716,11 +735,12 @@ func (t *Task) autoRefreshApps(apps []model.InstalledApp) []model.InstalledApp {
+ 	return refresh
+ }
+ 
++func shouldRefreshOnConnect(device model.Device, enabled, iphoneEnabled bool) bool {
++	return enabled && (!device.IsIPhone() || iphoneEnabled)
++}
++
+ func (t *Task) autoRefreshDeviceApps(device model.Device) error {
+-	if !device.IsIPhone() {
+-		return nil
+-	}
+-	if !app.Settings.Task.Enabled || !app.Settings.Task.IphoneEnabled {
++	if !shouldRefreshOnConnect(device, app.Settings.Task.Enabled, app.Settings.Task.IphoneEnabled) {
+ 		return nil
+ 	}
+ 	return t.refreshDeviceApps(device)
+@@ -750,7 +770,9 @@ func (t *Task) refreshDeviceApps(device model.Device) error {
+ 
+ 		// The iPhone may connect and disconnect instantly (for example, briefly lighting up the screen when receiving a message).
+ 		// Check to ensure the device can connect truly.
+-		time.Sleep(30 * time.Second)
++		if device.IsIPhone() {
++			time.Sleep(30 * time.Second)
++		}
+ 		if _, found := manager.GetDeviceByUDID(udid); !found {
+ 			return
+ 		}
+@@ -816,3 +838,6 @@ func ReloadTask() error {
+ func RefreshDeviceApps(device model.Device) error {
+ 	return instance.refreshDeviceApps(device)
+ }
++
++// StopTasks stops scheduling and asks the worker to exit during process shutdown.
++func StopTasks() { instance.Stop() }
+diff --git a/main.go b/main.go
+index c224907..872228d 100644
+--- a/main.go
++++ b/main.go
+@@ -4,6 +4,7 @@ import (
+ 	"embed"
+ 	"fmt"
+ 	"os"
++	"time"
+ 
+ 	"github.com/bitxeno/atvloadly/cmd/server"
+ 	"github.com/bitxeno/atvloadly/internal/app/build"
+@@ -23,6 +24,9 @@ const (
+ var localesFs embed.FS
+ 
+ func main() {
++	if os.Getenv("ATVLOADLY_STARTUP_DIAGNOSTICS") == "1" {
++		fmt.Fprintf(os.Stderr, "ATVLoadly entered main: %s pid=%d\n", time.Now().UTC().Format(time.RFC3339Nano), os.Getpid())
++	}
+ 	i18n.Init(localesFs)
+ 
+ 	cliApp := &cli.App{
 diff --git a/web/router.go b/web/router.go
-index e7e1ce1..02413df 100644
+index e7e1ce1..ffc6ed5 100644
 --- a/web/router.go
 +++ b/web/router.go
-@@ -32,6 +32,11 @@ import (
+@@ -14,11 +14,14 @@ import (
+ 	"time"
+ 
+ 	"github.com/bitxeno/atvloadly/internal/app"
++	"github.com/bitxeno/atvloadly/internal/app/build"
++	"github.com/bitxeno/atvloadly/internal/db"
+ 	"github.com/bitxeno/atvloadly/internal/i18n"
+ 	"github.com/bitxeno/atvloadly/internal/ipa"
+ 	"github.com/bitxeno/atvloadly/internal/manager"
+ 	mcpserver "github.com/bitxeno/atvloadly/internal/mcp"
+ 	"github.com/bitxeno/atvloadly/internal/model"
++	"github.com/bitxeno/atvloadly/internal/nativeupdate"
+ 	"github.com/bitxeno/atvloadly/internal/notify"
+ 	"github.com/bitxeno/atvloadly/internal/service"
+ 	"github.com/bitxeno/atvloadly/internal/signing"
+@@ -32,6 +35,44 @@ import (
  )
  
  func route(fi *fiber.App) {
 +	// Readiness is independent of IPA expiry: an expired app is not a dead backend.
 +	fi.Get("/native/ready", func(c *fiber.Ctx) error {
-+		return c.JSON(fiber.Map{"status": "ready"})
++		counts := map[string]int64{}
++		for _, table := range []string{"installed_apps", "signing_identities", "saved_sources"} {
++			var count int64
++			if err := db.Store().Raw("SELECT COUNT(*) FROM " + table).Scan(&count).Error; err != nil {
++				return c.SendStatus(503)
++			}
++			counts[table] = count
++		}
++		return c.JSON(fiber.Map{"status": "ready", "version": build.Version, "probation": nativeupdate.Probation(), "counts": counts})
 +	})
 +
++	fi.Post("/native/quiesce", func(c *fiber.Ctx) error {
++		if !nativeupdate.Authorized(c.Get("X-ATV-Control")) {
++			return c.SendStatus(401)
++		}
++		if err := nativeupdate.Operations.Quiesce(func() bool { return len(task.GetCurrentInstallingApps()) > 0 }); err != nil {
++			return c.Status(409).JSON(fiber.Map{"error": err.Error()})
++		}
++		return c.JSON(fiber.Map{"quiesced": true})
++	})
++	fi.Post("/native/resume", func(c *fiber.Ctx) error {
++		if !nativeupdate.Authorized(c.Get("X-ATV-Control")) {
++			return c.SendStatus(401)
++		}
++		nativeupdate.Operations.Resume()
++		return c.JSON(fiber.Map{"resumed": true})
++	})
++	fi.Post("/native/commit", func(c *fiber.Ctx) error {
++		if !nativeupdate.Authorized(c.Get("X-ATV-Control")) {
++			return c.SendStatus(401)
++		}
++		if err := nativeupdate.Commit(); err != nil {
++			return c.Status(500).JSON(fiber.Map{"error": err.Error()})
++		}
++		return c.JSON(fiber.Map{"committed": true})
++	})
  	mcpHandler := adaptor.HTTPHandler(mcpserver.NewHTTPHandler())
  	fi.All("/mcp", mcpHandler)
  	fi.All("/mcp/*", mcpHandler)
+@@ -70,9 +111,33 @@ func route(fi *fiber.App) {
+ 		}
+ 		return fiber.ErrUpgradeRequired
+ 	})
+-	fi.Get("/ws/pair", websocket.New(service.HandlePairMessage))
+-	fi.Get("/ws/install", websocket.New(service.HandleInstallMessage))
+-	fi.Get("/ws/login", websocket.New(service.HandleLoginMessage))
++	fi.Get("/ws/pair", websocket.New(func(c *websocket.Conn) {
++		release, err := nativeupdate.Operations.Enter()
++		if err != nil {
++			_ = c.Close()
++			return
++		}
++		defer release()
++		service.HandlePairMessage(c)
++	}))
++	fi.Get("/ws/install", websocket.New(func(c *websocket.Conn) {
++		release, err := nativeupdate.Operations.Enter()
++		if err != nil {
++			_ = c.Close()
++			return
++		}
++		defer release()
++		service.HandleInstallMessage(c)
++	}))
++	fi.Get("/ws/login", websocket.New(func(c *websocket.Conn) {
++		release, err := nativeupdate.Operations.Enter()
++		if err != nil {
++			_ = c.Close()
++			return
++		}
++		defer release()
++		service.HandleLoginMessage(c)
++	}))
+ 	fi.Get("/ws/tools/scan", websocket.New(service.HandleScanMessage))
+ 	fi.Get("/apps/:id/icon", func(c *fiber.Ctx) error {
+ 		id := utils.MustParseInt(c.Params("id"))
 diff --git a/web/router_test.go b/web/router_test.go
 index 66825a2..42a1c60 100644
 --- a/web/router_test.go
@@ -77,12 +585,167 @@ index 66825a2..42a1c60 100644
  	resp, err := server.Test(httptest.NewRequest(http.MethodPost, "/api/apps/"+strconv.FormatUint(uint64(record.ID), 10)+"/delete", nil))
  	if err != nil {
  		t.Fatal(err)
+diff --git a/web/web.go b/web/web.go
+index 06f5819..e0bf40c 100644
+--- a/web/web.go
++++ b/web/web.go
+@@ -1,12 +1,20 @@
+ package web
+ 
+ import (
++	"context"
+ 	"fmt"
+ 	"math"
++	"os"
++	"os/signal"
+ 	"runtime/debug"
++	"syscall"
++	"time"
+ 
+ 	"github.com/bitxeno/atvloadly/internal/app"
++	"github.com/bitxeno/atvloadly/internal/db"
+ 	"github.com/bitxeno/atvloadly/internal/log"
++	"github.com/bitxeno/atvloadly/internal/manager"
++	"github.com/bitxeno/atvloadly/internal/task"
+ 	"github.com/gofiber/fiber/v2"
+ 	"github.com/gofiber/fiber/v2/middleware/logger"
+ 	"github.com/gofiber/fiber/v2/middleware/recover"
+@@ -37,9 +45,37 @@ func Run(addr string, port int) error {
+ 	}))
+ 
+ 	route(server)
+-	if err := server.Listen(fmt.Sprintf("%s:%d", addr, port)); err != nil {
+-		log.Error(err.Error())
++
++	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
++	defer cancel()
++	serveErrors := make(chan error, 1)
++	go func() { serveErrors <- server.Listen(fmt.Sprintf("%s:%d", addr, port)) }()
++	select {
++	case err := <-serveErrors:
+ 		return err
++	case <-ctx.Done():
++		manager.StopDeviceManager()
++		if err := server.ShutdownWithTimeout(5 * time.Second); err != nil {
++			log.Err(err).Msg("HTTP shutdown timeout")
++		}
++		stopped := make(chan struct{})
++		go func() { task.StopTasks(); close(stopped) }()
++		select {
++		case <-stopped:
++		case <-time.After(2 * time.Second):
++			log.Warn("Timed out waiting for background checks during shutdown")
++		}
++		if err := app.FlushSettings(); err != nil {
++			log.Err(err).Msg("Failed to flush settings before shutdown")
++		}
++		if result := db.Store().Exec("PRAGMA wal_checkpoint(TRUNCATE)"); result.Error != nil {
++			log.Err(result.Error).Msg("Database checkpoint failed")
++		}
++		if sqlDB, err := db.Store().DB(); err == nil {
++			if err := sqlDB.Close(); err != nil {
++				log.Err(err).Msg("Database close failed")
++			}
++		}
++		return nil
+ 	}
+-	return nil
+ }
+diff --git a/internal/app/macos_settings_test.go b/internal/app/macos_settings_test.go
+new file mode 100644
+index 0000000..34c59be
+--- /dev/null
++++ b/internal/app/macos_settings_test.go
+@@ -0,0 +1,41 @@
++package app
++
++import (
++	"encoding/json"
++	"os"
++	"path/filepath"
++	"testing"
++)
++
++func TestAtomicSettingsFlushKeepsScheduleAndPrivatePermissions(t *testing.T) {
++	old := Settings
++	defer func() { Settings = old }()
++	Settings = &SettingsConfiguration{}
++	Settings.Task.Enabled = true
++	Settings.Task.CrodTime = "0 4 * * *"
++	path := filepath.Join(t.TempDir(), "settings.json")
++	if err := flushSettingsTo(path); err != nil {
++		t.Fatal(err)
++	}
++	info, err := os.Stat(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if info.Mode().Perm() != 0600 {
++		t.Fatal("settings permissions are not private")
++	}
++	var saved SettingsConfiguration
++	b, err := os.ReadFile(path)
++	if err != nil {
++		t.Fatal(err)
++	}
++	if err = json.Unmarshal(b, &saved); err != nil {
++		t.Fatal(err)
++	}
++	if !saved.Task.Enabled || saved.Task.CrodTime != Settings.Task.CrodTime {
++		t.Fatal("schedule lost during flush")
++	}
++	if _, err = os.Stat(path + ".tmp"); !os.IsNotExist(err) {
++		t.Fatal("temporary settings file was not committed")
++	}
++}
+diff --git a/internal/task/macos_refresh_test.go b/internal/task/macos_refresh_test.go
+new file mode 100644
+index 0000000..8a87511
+--- /dev/null
++++ b/internal/task/macos_refresh_test.go
+@@ -0,0 +1,36 @@
++package task
++
++import (
++	"context"
++	"errors"
++	"github.com/bitxeno/atvloadly/internal/model"
++	"github.com/bitxeno/atvloadly/internal/signing"
++	"testing"
++)
++
++func TestAppleTVReconnectRetriesRefresh(t *testing.T) {
++	tv := model.Device{DeviceClass: "AppleTV"}
++	phone := model.Device{DeviceClass: "iPhone"}
++	if !shouldRefreshOnConnect(tv, true, false) {
++		t.Fatal("Apple TV incorrectly gated by iPhone refresh preference")
++	}
++	if shouldRefreshOnConnect(tv, false, true) {
++		t.Fatal("disabled refresh started")
++	}
++	if shouldRefreshOnConnect(phone, true, false) {
++		t.Fatal("disabled iPhone refresh started")
++	}
++	if !shouldRefreshOnConnect(phone, true, true) {
++		t.Fatal("enabled iPhone refresh did not start")
++	}
++}
++func TestUnreachableTVDoesNotBlacklistIPABuild(t *testing.T) {
++	for _, err := range []error{signing.Errorf(signing.ClassTransport, signing.CodeDeviceUnreachable, "device asleep"), context.DeadlineExceeded} {
++		if failedSourceBuildID("nuvio-release", err) != "" {
++			t.Fatal("temporary transport failure permanently blacklisted update")
++		}
++	}
++	if failedSourceBuildID("bad-build", errors.New("invalid IPA")) != "bad-build" {
++		t.Fatal("invalid IPA lost its failure guard")
++	}
++}
 diff --git a/internal/manager/device_manager_mdns_macos_test.go b/internal/manager/device_manager_mdns_macos_test.go
 new file mode 100644
-index 0000000..c051837
+index 0000000..cc52be2
 --- /dev/null
 +++ b/internal/manager/device_manager_mdns_macos_test.go
-@@ -0,0 +1,42 @@
+@@ -0,0 +1,56 @@
 +//go:build !linux
 +
 +package manager
@@ -90,6 +753,7 @@ index 0000000..c051837
 +import (
 +	"net/netip"
 +	"testing"
++	"time"
 +
 +	"github.com/betamos/zeroconf"
 +	"github.com/bitxeno/atvloadly/internal/model"
@@ -125,3 +789,268 @@ index 0000000..c051837
 +}
 +
 +func TestMDNSNilService(t *testing.T) { newDeviceManager().handleMDNSEvent(zeroconf.Event{}) }
++
++func TestDiscoveryRestartsAfterNetworkChangeOrSleep(t *testing.T) {
++	before := time.Unix(1000, 0)
++	if discoveryNeedsRestart("en0:192.168.1.2", "en0:192.168.1.2", before, before.Add(15*time.Second)) {
++		t.Fatal("normal tick restarted discovery")
++	}
++	if !discoveryNeedsRestart("en0:192.168.1.2", "en1:192.168.1.3", before, before.Add(15*time.Second)) {
++		t.Fatal("interface change ignored")
++	}
++	if !discoveryNeedsRestart("same", "same", before, before.Add(5*time.Minute)) {
++		t.Fatal("resume after sleep ignored")
++	}
++}
+diff --git a/internal/nativeupdate/control_test.go b/internal/nativeupdate/control_test.go
+new file mode 100644
+index 0000000..0f770aa
+--- /dev/null
++++ b/internal/nativeupdate/control_test.go
+@@ -0,0 +1,86 @@
++package nativeupdate
++
++import (
++	"errors"
++	"os"
++	"path/filepath"
++	"sync"
++	"testing"
++)
++
++func TestGatePreventsUpdateDuringWork(t *testing.T) {
++	var g Gate
++	release, err := g.Enter()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !errors.Is(g.Quiesce(nil), ErrBusy) {
++		t.Fatal("update allowed during installation")
++	}
++	release()
++	release()
++	if !errors.Is(g.Quiesce(func() bool { return true }), ErrBusy) {
++		t.Fatal("queued install ignored")
++	}
++	if err = g.Quiesce(nil); err != nil {
++		t.Fatal(err)
++	}
++	if _, err = g.Enter(); !errors.Is(err, ErrMaintenance) {
++		t.Fatal("installation started during update")
++	}
++	g.Resume()
++	release, err = g.Enter()
++	if err != nil {
++		t.Fatal(err)
++	}
++	release()
++}
++func TestGateConcurrentSessions(t *testing.T) {
++	var g Gate
++	var wg sync.WaitGroup
++	for range 32 {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			release, err := g.Enter()
++			if err == nil {
++				release()
++			}
++		}()
++	}
++	wg.Wait()
++	if err := g.Quiesce(nil); err != nil {
++		t.Fatal(err)
++	}
++}
++
++func TestProbationRequiresAuthenticatedCommit(t *testing.T) {
++	root := t.TempDir()
++	marker := filepath.Join(root, "pending.json")
++	if err := os.WriteFile(marker, []byte("{}"), 0600); err != nil {
++		t.Fatal(err)
++	}
++	t.Setenv("ATVLOADLY_UPDATE_JOURNAL", marker)
++	oldToken, oldProbation, oldStart := token, probation, startJobs
++	defer func() { Operations = Gate{}; token = oldToken; probation = oldProbation; startJobs = oldStart }()
++	Operations = Gate{}
++	calls := 0
++	if err := Initialize(root, func() error { calls++; return nil }); err != nil {
++		t.Fatal(err)
++	}
++	if !Probation() || Authorized("wrong") || !Authorized(token) {
++		t.Fatal("probation/control authentication failed")
++	}
++	if _, err := Operations.Enter(); !errors.Is(err, ErrMaintenance) {
++		t.Fatal("install allowed during probation")
++	}
++	if err := Commit(); err != nil {
++		t.Fatal(err)
++	}
++	if err := Commit(); err != nil {
++		t.Fatal(err)
++	}
++	if Probation() || calls != 1 {
++		t.Fatal("commit did not start jobs exactly once")
++	}
++}
+diff --git a/internal/nativeupdate/control.go b/internal/nativeupdate/control.go
+new file mode 100644
+index 0000000..c34119a
+--- /dev/null
++++ b/internal/nativeupdate/control.go
+@@ -0,0 +1,106 @@
++// Package nativeupdate coordinates native application updates with installation work.
++package nativeupdate
++
++import (
++	"crypto/rand"
++	"crypto/subtle"
++	"encoding/hex"
++	"errors"
++	"os"
++	"path/filepath"
++	"strings"
++	"sync"
++)
++
++var ErrBusy = errors.New("an installation or installation session is active")
++var ErrMaintenance = errors.New("application update in progress")
++
++type Gate struct {
++	mu          sync.Mutex
++	active      int
++	maintenance bool
++}
++
++func (g *Gate) Enter() (func(), error) {
++	g.mu.Lock()
++	defer g.mu.Unlock()
++	if g.maintenance {
++		return nil, ErrMaintenance
++	}
++	g.active++
++	var once sync.Once
++	return func() { once.Do(func() { g.mu.Lock(); g.active--; g.mu.Unlock() }) }, nil
++}
++func (g *Gate) Quiesce(pending func() bool) error {
++	g.mu.Lock()
++	defer g.mu.Unlock()
++	if g.active > 0 || (pending != nil && pending()) {
++		return ErrBusy
++	}
++	g.maintenance = true
++	return nil
++}
++func (g *Gate) Resume() { g.mu.Lock(); g.maintenance = false; g.mu.Unlock() }
++
++var Operations Gate
++var token string
++var probation bool
++var startJobs func() error
++var commitMu sync.Mutex
++
++func Initialize(dataDir string, start func() error) error {
++	path := filepath.Join(dataDir, ".native-control-token")
++	b, err := os.ReadFile(path)
++	if os.IsNotExist(err) {
++		random := make([]byte, 32)
++		if _, err = rand.Read(random); err != nil {
++			return err
++		}
++		b = []byte(hex.EncodeToString(random))
++		if err = os.WriteFile(path, b, 0600); err != nil {
++			return err
++		}
++	} else if err != nil {
++		return err
++	}
++	if len(strings.TrimSpace(string(b))) != 64 {
++		return errors.New("invalid native control token")
++	}
++	if err = os.Chmod(path, 0600); err != nil {
++		return err
++	}
++	token = strings.TrimSpace(string(b))
++	startJobs = start
++	if path := os.Getenv("ATVLOADLY_UPDATE_JOURNAL"); path != "" {
++		if _, err := os.Stat(path); err == nil {
++			probation = true
++			return Operations.Quiesce(nil)
++		} else if !os.IsNotExist(err) {
++			return err
++		}
++	}
++	return nil
++}
++func Authorized(candidate string) bool {
++	return token != "" && subtle.ConstantTimeCompare([]byte(candidate), []byte(token)) == 1
++}
++func Probation() bool { commitMu.Lock(); defer commitMu.Unlock(); return probation }
++func Commit() error {
++	commitMu.Lock()
++	defer commitMu.Unlock()
++	if !probation {
++		return nil
++	}
++	if startJobs == nil {
++		return errors.New("service not initialized")
++	}
++	Operations.Resume()
++	if err := startJobs(); err != nil {
++		_ = Operations.Quiesce(nil)
++		return err
++	}
++	probation = false
++	return nil
++}
++
++func Recover() error { return recoverWatchdog(os.Getenv("ATVLOADLY_UPDATE_JOURNAL")) }
+diff --git a/internal/nativeupdate/recovery_other.go b/internal/nativeupdate/recovery_other.go
+new file mode 100644
+index 0000000..e1958d9
+--- /dev/null
++++ b/internal/nativeupdate/recovery_other.go
+@@ -0,0 +1,5 @@
++//go:build !darwin
++
++package nativeupdate
++
++func recoverWatchdog(string) error { return nil }
+diff --git a/internal/nativeupdate/recovery_darwin.go b/internal/nativeupdate/recovery_darwin.go
+new file mode 100644
+index 0000000..d324eb4
+--- /dev/null
++++ b/internal/nativeupdate/recovery_darwin.go
+@@ -0,0 +1,31 @@
++//go:build darwin
++
++package nativeupdate
++
++import (
++	"os"
++	"os/exec"
++	"path/filepath"
++	"syscall"
++)
++
++func recoverWatchdog(path string) error {
++	executable := filepath.Join(filepath.Dir(path), "watchdog")
++	if _, err := os.Stat(executable); err != nil {
++		return err
++	}
++	log, err := os.OpenFile(filepath.Join(filepath.Dir(path), "watchdog.log"), os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0600)
++	if err != nil {
++		return err
++	}
++	defer func() { _ = log.Close() }()
++	cmd := exec.Command(executable, "watch", path)
++	cmd.Stdout = log
++	cmd.Stderr = log
++	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
++	if err := cmd.Start(); err != nil {
++		return err
++	}
++	_ = cmd.Process.Release()
++	return nil
++}

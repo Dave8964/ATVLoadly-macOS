@@ -1,70 +1,72 @@
-# Native macOS integration — candidate, not production qualified
+# Native integration
 
-Base: official ATVLoadly v0.7.3 (`533aee4`). PlumeImpactor is derived from
-that release's Dockerfile (v2.7.1-patch.3), never from a Linux executable.
-Requires Apple Silicon, macOS 13+, Go, Node/npm, Rust/Cargo and Command Line Tools.
+Build from the integration repository with `./build.sh v0.7.3`. The build derives
+PlumeImpactor's tag from upstream's Dockerfile, verifies the Sparkle distribution
+checksum, runs Go/frontend/helper tests, compiles native binaries, verifies arm64
+architecture and bundle signatures, and runs isolated HTTP startup smoke tests.
+No Linux binaries or Docker runtime are used. Upstream worktrees/build caches
+and output are excluded from Git.
 
-Build: `./macos/build.sh`. The script compiles and tests the frontend and Go
-backend, compiles the locked Rust signing engine, compiles the Cocoa controller,
-bundles Sparkle 2.10.0 and verifies code signatures. The signed app is staged
-under `/private/tmp/atvloadly-build.*` to avoid cloud file-provider FinderInfo
-attributes contaminating signatures. The portable ZIP and SHA256SUMS are in
-`output/`. Extract the ZIP outside cloud-synced folders before running it.
-Ad-hoc signing provides local integrity, not Developer ID identity/notarization.
+The menu app installs a direct-executable user launch agent at
+`~/Library/LaunchAgents/local.atvloadly.native.backend.plist`. It preserves an
+existing `local.atvloadly.agent` service and will not silently take over its live
+database. Login startup uses SMAppService. Service data lives in
+`~/Library/Application Support/ATVLoadly/data`; pairing data retains upstream's
+`~/.config/PlumeImpactor` and lockdown locations. The initial transition from an
+existing installation requires an approved final backup and service cutover.
 
-The menu app supervises a direct Go executable through a per-user launch agent;
-SMAppService controls menu-app login startup. It does not replace a loaded
-`local.atvloadly.agent` service. No startup delay has been attributed to a root
-cause, and no cold-login result is claimed. Native service setup must not be
-activated until the existing service and data migration have been reviewed.
+## Update transaction
 
-Discovery now handles address-update events and omits raw mDNS TXT records from
-logs. Tests cover the stale-address regression. Existing upstream pairing,
-refresh, deduplication, source tracking and secret-store code is retained.
-An isolated copy of the existing pairing records discovered two Apple TVs,
-and read-only device-info commands succeeded against both. New pairing,
-sleep/reconnection, IPA installation and Nuvio refresh remain unverified. No live signing/installation was initiated during the build.
+Sparkle handles HTTPS retrieval, signature verification, compatible-architecture
+selection, version comparison, notification state, replacement and relaunch.
+A dedicated Ed25519 public key is embedded in every app; its private counterpart
+is stored in Keychain locally and as an Actions secret for the isolated signing job.
+Feeds, archives and release notes are signed and checked before extraction.
 
-## Updates
+The app's termination delegate runs the native update agent before allowing a
+replacement. Its authenticated control endpoint atomically rejects an update
+while installations are queued or active, or pairing/login/install sessions are
+open. The agent stops launchd supervision, waits for backend exit, copies the app,
+data, settings and pairing records, checks code signatures and SQLite integrity,
+and records expected app/source/signing-identity counts. Shutdown flushes settings
+and checkpoints SQLite before backup. The old app is retained.
 
-Sparkle is bundled with signed-feed and verify-before-extraction settings.
-Set ATV_UPDATE_FEED and ATV_UPDATE_PUBLIC_KEY together to embed a trusted feed.
-The UI fails closed when no feed/key exists. Installation is deliberately
-blocked by a delegate until application/data backup, install-job quiescing,
-replacement health validation and automatic rollback are implemented and tested.
-This is an explicit incomplete requirement, not a functioning self-updater.
+The replacement starts in probation, with installations and scheduled jobs blocked.
+The independent watchdog verifies bundle build, upstream version, DB-backed HTTP
+readiness, record counts and code signatures before committing. It also checks
+every original database column and row, protected key/configuration files, and
+existing settings values; additive upstream migrations are allowed. Unhealthy builds
+time out and restore the previous app and data. Failed replacement data is retained
+for diagnosis. Once jobs may have resumed, ambiguous commit failures are reported
+for attention rather than rolling back underneath a signing operation. Interrupted
+transactions restart their locked watchdog when the backend or menu app launches.
+The standard database layout `data/app.db` is required; unsupported layouts fail
+preparation safely. Backups and watchdog diagnostics live in the private `updates/`
+directory alongside application data.
 
-The macOS candidate workflow polls official releases every six hours, selects
-stable SemVer versions, checks macOS patches against a fresh release, runs the
-native build and uploads candidates. Patch conflicts/build failures fail the
-job. It does not publish appcasts or releases, and it is not enabled until this
-repository is hosted on GitHub. Scheduled Actions may be disabled by GitHub after
-inactivity and must be monitored; a workflow file alone is not permanent hosting.
+## Automation and qualification
 
-## Data and migration
+The workflow detects official stable upstream releases, applies checked patches
+to fresh source and builds on Apple Silicon macOS runners. Failed patches/tests
+prevent publication. Versions and an integration fingerprint suppress repeat builds.
+Candidate releases are prereleases. Only after end-to-end qualification should
+`MACOS_RELEASES_QUALIFIED=true` be set in repository Actions variables; thereafter
+compatible releases automatically update the stable feed without a manual rebuild.
 
-Private backups live outside this source tree in ../output/backups/initial.
-They include SQLite snapshots (integrity checked), settings, data encryption keys,
-PlumeImpactor records and lockdown records found at the time of backup.
-Files have restrictive permissions and are excluded from Git. Do not publish
-backup contents, production logs, keys or configuration. Backup hashes cover the
-copied snapshots; they do not claim to freeze a still-running production service.
+Source release notes are included. A successful-sync record is refreshed every
+14 days to keep repository activity current. Workflow/auth/signing failures remain
+visible in Actions. Hosting and account access remain prerequisites for delivery.
 
-The installed application, launch agents and live databases have not been
-replaced. A production migration must first quiesce the old service, take a final
-consistent backup, validate migrated data in isolation, and retain the old app.
-Do not point two backends at the same production database.
+## Verification limits
 
-## Remaining release gates
+Local checks cover Go/frontend/Rust/Swift compilation, code-signing integrity,
+isolated HTTP startup, mDNS address updates and resume decisions, stable release
+selection, installation exclusion, probation, healthy commit and failed-update
+filesystem rollback. Two Apple TVs were discovered from copied pairing records,
+and read-only communication succeeded. No live configuration was reset.
 
-- GitHub authentication and a dedicated release repository.
-- Secure update-signing key provisioning and signed release publication.
-- Installation interlock, transactional backup and tested health-based rollback.
-- Full signed update installation test using old and new bundles.
-- Physical Apple TV discovery/pair/reconnect/install and Nuvio renewal tests.
-- Real cold-login startup measurement and investigation of the reported delay.
-- Review/approval before replacing the existing installation.
-
-`python3 -m unittest discover -s macos/tests -v` validates release selection.
-`python3 macos/smoke.py /path/to/ATVLoadly.app` tests three isolated backend
-starts and HTTP routes. It does not represent a reboot or real-device test.
+Still required: a full signed Sparkle update/relaunch against an installed app,
+physical sleep/reconnection tests, actual IPA signing/installation/renewal and
+cold-login measurement. Fast manual starts do not establish that the reported
+pre-main reboot delay has been fixed. Production release qualification stays off
+until those gates pass. No installed application has been replaced yet.

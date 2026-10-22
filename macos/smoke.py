@@ -31,5 +31,7 @@ for iteration in range(3):
             finally:
                 p.terminate()
                 try: p.wait(timeout=5)
-                except subprocess.TimeoutExpired: p.kill();p.wait()
+                except subprocess.TimeoutExpired: p.kill();p.wait();raise RuntimeError("Backend did not shut down gracefully")
+                if p.returncode != 0: raise RuntimeError(f"Backend shutdown exit status {p.returncode}")
+                results[-1]["graceful_shutdown"] = True
 print(json.dumps({'kind':'isolated manual process starts, not cold-login tests','results':results},indent=2))

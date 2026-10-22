@@ -7,12 +7,20 @@ final class Controller: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     private let state = NSMenuItem(title: "Starting…", action: nil, keyEquivalent: "")
     private let latest = NSMenuItem(title: "Latest Available Version: not checked", action: nil, keyEquivalent: "")
     private var updater: SPUStandardUpdaterController?
+    private var loginItem: NSMenuItem?
+    private var releaseNotesURL: URL?
     private let home = FileManager.default.homeDirectoryForCurrentUser
     private var root: URL { home.appendingPathComponent("Library/Application Support/ATVLoadly") }
     private let base = URL(string: "http://127.0.0.1:5533")!
     private var timer: Timer?
+    private var updateTarget: SUAppcastItem?
+    private var preparedUpdate = false
+    private var preparingUpdate = false
 
     func applicationDidFinishLaunching(_ note: Notification) {
+        let updates = root.appendingPathComponent("updates")
+        try? FileManager.default.createDirectory(at: updates, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+        try? String(ProcessInfo.processInfo.processIdentifier).write(to: updates.appendingPathComponent("ui-pid"), atomically: true, encoding: .utf8)
         status = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         status.button?.image = NSImage(systemSymbolName: "appletv", accessibilityDescription: "ATVLoadly")
         let menu = NSMenu()
@@ -25,18 +33,32 @@ final class Controller: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         add(menu, "Check for Updates…", #selector(check))
         add(menu, "Install Update…", #selector(check))
         add(menu, "Automatically Check for Updates", #selector(toggleChecks)).state = UserDefaults.standard.object(forKey: "SUEnableAutomaticChecks") as? Bool == false ? .off : .on
-        // Silent installation stays disabled until the rollback qualification suite passes.
-        let auto = add(menu, "Automatically Install Compatible Updates (qualification pending)", #selector(autoInstall))
-        auto.isEnabled = false
+        add(menu, "Automatically Install Compatible Updates on Quit", #selector(autoInstall)).state = UserDefaults.standard.bool(forKey: "SUAutomaticallyUpdate") ? .on : .off
         add(menu, "View Release Notes", #selector(notes))
         menu.addItem(.separator())
-        add(menu, "Start at Login", #selector(login)).state = SMAppService.mainApp.status == .enabled ? .on : .off
+        loginItem = add(menu, "Start at Login", #selector(login)); loginItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
         add(menu, "Quit", #selector(quit))
         status.menu = menu
         if let feed = Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") as? String, feed.hasPrefix("https://"), Bundle.main.object(forInfoDictionaryKey: "SUPublicEDKey") != nil {
             updater = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: self, userDriverDelegate: nil)
         }
         do { try prepareService() } catch { show("Service setup failed", error.localizedDescription) }
+        if FileManager.default.fileExists(atPath: updates.appendingPathComponent("pending.json").path) {
+            let recovery = Process(); recovery.executableURL = updates.appendingPathComponent("watchdog"); recovery.arguments = ["watch",updates.appendingPathComponent("pending.json").path]
+            try? recovery.run()
+        }
+        if !UserDefaults.standard.bool(forKey: "ATVInitialLoginRegistered") {
+            do { try SMAppService.mainApp.register(); UserDefaults.standard.set(true,forKey:"ATVInitialLoginRegistered") } catch { show("Login startup needs attention",error.localizedDescription) }
+        }
+        if let resultData = try? Data(contentsOf: updates.appendingPathComponent("last-result.json")),
+           let result = try? JSONSerialization.jsonObject(with: resultData) as? [String:Any],
+           let phase = result["Phase"] as? String, phase.hasPrefix("rolled-back"),
+           let backup = result["Backup"] as? String, UserDefaults.standard.string(forKey: "ATVReportedRollback") != backup {
+            UserDefaults.standard.set(backup,forKey: "ATVReportedRollback")
+            show("Update rolled back", phase + "\nYour previous application and data have been restored. Backups and diagnostics are in " + updates.path)
+        }
+        loginItem?.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        if SMAppService.mainApp.status == .requiresApproval { loginItem?.title = "Start at Login — approval required" }
         poll()
         timer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in self?.poll() }
     }
@@ -63,7 +85,7 @@ final class Controller: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         let label = "local.atvloadly.native.backend"
         let plist = agents.appendingPathComponent(label + ".plist")
         let bin = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/bin")
-        let values: [String:Any] = ["Label":label,"ProgramArguments":[bin.appendingPathComponent("atvloadly").path,"server","-p","5533","-c",config.path],"RunAtLoad":true,"KeepAlive":true,"ThrottleInterval":5,"ProcessType":"Background","WorkingDirectory":root.path,"EnvironmentVariables":["PATH":bin.path + ":/usr/bin:/bin:/usr/sbin:/sbin","HOME":home.path],"StandardOutPath":root.appendingPathComponent("service.log").path,"StandardErrorPath":root.appendingPathComponent("service-error.log").path]
+        let values: [String:Any] = ["Label":label,"ProgramArguments":[bin.appendingPathComponent("atvloadly").path,"server","-p","5533","-c",config.path],"RunAtLoad":true,"KeepAlive":true,"ThrottleInterval":5,"ProcessType":"Interactive","WorkingDirectory":root.path,"EnvironmentVariables":["PATH":bin.path + ":/usr/bin:/bin:/usr/sbin:/sbin","HOME":home.path,"ATVLOADLY_STARTUP_DIAGNOSTICS":"1","ATVLOADLY_UPDATE_JOURNAL":root.appendingPathComponent("updates/pending.json").path],"StandardOutPath":root.appendingPathComponent("service.log").path,"StandardErrorPath":root.appendingPathComponent("service-error.log").path]
         // Do not take the port or live database from an existing installation.
         let probe = Process(); probe.executableURL = URL(fileURLWithPath: "/bin/launchctl"); probe.arguments = ["print","gui/\(getuid())/local.atvloadly.agent"]; probe.standardOutput = FileHandle.nullDevice; probe.standardError = FileHandle.nullDevice
         try probe.run(); probe.waitUntilExit()
@@ -77,8 +99,10 @@ final class Controller: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
     }
     private func poll() {
         var request = URLRequest(url: base.appendingPathComponent("native/ready")); request.timeoutInterval = 2
-        URLSession.shared.dataTask(with: request) { _, response, _ in
-            DispatchQueue.main.async { self.state.title = (response as? HTTPURLResponse)?.statusCode == 200 ? "Backend ready" : "Replacement backend offline" }
+        URLSession.shared.dataTask(with: request) { data, response, _ in
+            let json = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String:Any] }
+            let probation = json?["probation"] as? Bool == true
+            DispatchQueue.main.async { self.state.title = (response as? HTTPURLResponse)?.statusCode == 200 ? (probation ? "Validating update — refresh jobs paused" : "Backend ready") : "Replacement backend offline" }
         }.resume()
     }
     private func show(_ title: String, _ text: String) { let a = NSAlert(); a.messageText = title; a.informativeText = text; a.runModal() }
@@ -89,15 +113,47 @@ final class Controller: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
         updater.checkForUpdates(nil)
     }
     @objc private func toggleChecks(_ sender: NSMenuItem) { sender.state = sender.state == .on ? .off : .on; UserDefaults.standard.set(sender.state == .on, forKey: "SUEnableAutomaticChecks"); updater?.updater.automaticallyChecksForUpdates = sender.state == .on }
-    @objc private func autoInstall() {}
-    @objc private func notes() { NSWorkspace.shared.open(URL(string: "https://github.com/bitxeno/atvloadly/releases")!) }
-    @objc private func login(_ sender: NSMenuItem) { do { if SMAppService.mainApp.status == .enabled {try SMAppService.mainApp.unregister()} else {try SMAppService.mainApp.register()}; sender.state = SMAppService.mainApp.status == .enabled ? .on : .off } catch {show("Login startup",error.localizedDescription)} }
+    @objc private func autoInstall(_ sender: NSMenuItem) { sender.state = sender.state == .on ? .off : .on; UserDefaults.standard.set(sender.state == .on, forKey: "SUAutomaticallyUpdate"); updater?.updater.automaticallyDownloadsUpdates = sender.state == .on }
+    @objc private func notes() { NSWorkspace.shared.open(releaseNotesURL ?? URL(string: "https://github.com/bitxeno/atvloadly/releases")!) }
+    @objc private func login(_ sender: NSMenuItem) { if SMAppService.mainApp.status == .requiresApproval { SMAppService.openSystemSettingsLoginItems(); return }; do { if SMAppService.mainApp.status == .enabled {try SMAppService.mainApp.unregister()} else {try SMAppService.mainApp.register()}; sender.state = SMAppService.mainApp.status == .enabled ? .on : .off } catch {show("Login startup",error.localizedDescription)} }
     @objc private func quit() { NSApp.terminate(nil) }
-    func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) { latest.title = "Latest Available Version: \(item.displayVersionString)"; status.button?.title = "↑" }
-    func updater(_ updater: SPUUpdater, mayPerform updateCheck: SPUUpdateCheck) throws {
-        // Fail closed until transactional rollback has been verified against a published build.
-        throw NSError(domain: "ATVLoadly.UpdateQualification", code: 1, userInfo: [NSLocalizedDescriptionKey:"Update installation is disabled pending end-to-end rollback qualification. Your installed app and data are unchanged."])
+    func updater(_ updater: SPUUpdater, didFindValidUpdate item: SUAppcastItem) { latest.title = "Latest Available Version: \(item.displayVersionString) (build \(item.versionString))"; releaseNotesURL = item.releaseNotesURL; status.button?.title = "↑" }
+    func updater(_ updater: SPUUpdater, willInstallUpdate item: SUAppcastItem) { updateTarget = item }
+    func updater(_ updater: SPUUpdater, willInstallUpdateOnQuit item: SUAppcastItem, immediateInstallationBlock: @escaping () -> Void) -> Bool {
+        updateTarget = item
+        return false
     }
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard let target = updateTarget, !preparedUpdate else { return .terminateNow }
+        if preparingUpdate { return .terminateLater }
+        preparingUpdate = true
+        let helper = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/bin/update-agent")
+        let appPath = Bundle.main.bundleURL.path
+        let dataRoot = root.path
+        let build = target.versionString
+        let upstream = target.displayVersionString
+        DispatchQueue.global(qos: .userInitiated).async {
+            let process = Process(); process.executableURL = helper
+            process.arguments = ["prepare", appPath, dataRoot, build, upstream]
+            let output = Pipe(); process.standardError = output
+            var failure: String?
+            do {
+                try process.run()
+                let data = output.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                if process.terminationStatus != 0 { failure = String(data: data, encoding: .utf8) ?? "Update preparation failed." }
+            } catch { failure = error.localizedDescription }
+            DispatchQueue.main.async {
+                if let failure { self.preparingUpdate = false; self.show("Update postponed", failure); sender.reply(toApplicationShouldTerminate: false) }
+                else { self.preparedUpdate = true; sender.reply(toApplicationShouldTerminate: true) }
+            }
+        }
+        return .terminateLater
+    }
+
+}
+if CommandLine.arguments.contains("--unregister-login") {
+    do { try SMAppService.mainApp.unregister(); UserDefaults.standard.set(false,forKey:"ATVInitialLoginRegistered"); exit(0) } catch { fputs("Login unregistration failed\n",stderr); exit(1) }
 }
 let app = NSApplication.shared
 let controller = Controller()

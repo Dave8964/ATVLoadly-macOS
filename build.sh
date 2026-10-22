@@ -12,3 +12,5 @@ git apply --check macos/patches/backend.patch
 git apply macos/patches/backend.patch
 ./macos/build.sh
 cp output/*.zip output/SHA256SUMS "$ROOT/output/releases/"
+
+python3 "$ROOT/macos/export-source.py" "$SOURCE" "$ROOT/output/releases/ATVLoadly-$TAG-macos-source.tar.gz"

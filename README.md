@@ -1,41 +1,52 @@
-# ATVLoadly for macOS — test candidate
+# ATVLoadly for macOS — release qualification in progress
 
 Native Apple Silicon integration for [bitxeno/atvloadly](https://github.com/bitxeno/atvloadly).
-Current verified base: **v0.7.3**. Requires macOS 13 or newer.
+Verified base: **v0.7.3**. Requires macOS 13 or newer.
 
-**This is not yet a finished self-updating distribution.** The candidate compiles
-the Go backend, Vue frontend, Swift menu-bar application and matching Rust
-PlumeImpactor. Sparkle is bundled, but installation stays disabled until update
-backup, install-job exclusion, backend health validation and automatic rollback
-are implemented and qualified. Do not replace a working installation with this
-candidate expecting unattended updates.
+The application includes a Swift menu-bar controller, supervised Go backend,
+compiled Vue frontend, native PlumeImpactor and Sparkle 2.10.0. The updater uses
+signed manifests and archives, excludes active installations/pairing/login sessions,
+backs up the stopped application's data, validates the replacement in probation,
+and restores the prior application/data after failed health checks.
 
-Build on an Apple Silicon Mac with Command Line Tools, Go, Node/npm and Rust:
+**This distribution is still a test candidate.** Filesystem rollback and healthy
+commit tests pass, but a complete Sparkle old-to-new installation, actual IPA
+installation/renewal and cold-login startup still need qualification. Existing
+installations must not be overwritten without explicit approval. No production
+update feed is published until the qualification gate is enabled.
+
+Build on an Apple Silicon Mac with Command Line Tools, Go 1.26.6, Node/npm and
+Rust 1.97.1:
 
 ```sh
 ./build.sh v0.7.3
 ```
 
-This checks out clean upstream source, checks/applies the macOS patch, runs tests,
-builds native components and writes a ZIP to `output/releases/`. An extracted
-signed app is staged under `/private/tmp/atvloadly-build.*` because cloud file
-providers can add metadata which invalidates macOS bundle signatures.
+The build checks out clean upstream source, applies the macOS patch, tests and
+builds all native components and writes ZIP/source archives to `output/releases/`.
+Apps are staged outside cloud-synced folders to prevent file-provider metadata
+from invalidating signatures. The local signing identity is ad-hoc; no paid Apple
+Developer certificate is assumed. Sparkle Ed25519 signatures authenticate updates.
 
-The GitHub Actions workflow detects stable upstream releases and builds candidates.
-It uploads test artifacts rather than publishing production updates. Patch or
-build failures stop the workflow. It has not been qualified as a release service.
+The GitHub workflow polls official releases every six hours and compares stable
+semantic versions. Unchanged upstream/integration inputs do not rebuild. New
+inputs must pass patch application, compilation, tests, packaging and signing on
+fresh runners. Signing credentials are available only in a separate signing job.
+Until `MACOS_RELEASES_QUALIFIED=true`, releases are explicitly marked prereleases.
+After one-time end-to-end qualification, successful builds publish the stable
+signed feed used by installed applications. Incompatible changes stop publication
+and preserve the last working release. A periodic successful-sync record keeps
+scheduled-workflow repository activity current; failures remain visible in Actions.
 
-The discovery patch handles changed mDNS addresses and removes raw TXT records
-from discovery logs. Local tests found two paired Apple TVs with copies of
-existing records; read-only device-information requests succeeded on both.
-This does not establish successful IPA installation, renewal, or reconnection
-after sleep. Manual isolated backend starts were below one second; cold-login
-startup and the reported pre-main delay remain unverified.
+Discovery handles address updates and rebuilds its browsers after interface
+changes or sleep. Two paired Apple TVs were discovered using copied records, and
+read-only device-information requests succeeded on both. Apple TV reconnects can
+retry pending signature renewal; transient device failures do not permanently
+blacklist IPA source builds. IPA updates remain separate from signature renewal.
 
 Private configuration, databases, logs, Apple IDs, pairing files, signing keys and
-local backups are excluded from this repository. Existing installations must be
-backed up and migrated with explicit user approval. See [integration notes](macos/README.md)
-for limitations and release gates.
+backups are excluded from this repository. See [integration notes](macos/README.md)
+for operating details and remaining verification gates.
 
-Code from ATVLoadly and its macOS integration is distributed under the included
-AGPL-3.0 license. Sparkle and PlumeImpactor retain their respective upstream licenses.
+ATVLoadly and the integration use the included AGPL-3.0 license. Sparkle and
+PlumeImpactor retain their upstream licenses, included in packaged applications.

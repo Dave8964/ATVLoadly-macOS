@@ -1,4 +1,4 @@
-name: macOS upstream candidate
+name: macOS upstream releases
 on:
   workflow_dispatch:
   schedule:
@@ -6,63 +6,62 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: macos-upstream-candidate
+  group: macos-upstream-release
   cancel-in-progress: false
 jobs:
-  candidate:
-    runs-on: macos-15
-    timeout-minutes: 90
+  detect:
+    runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.select.outputs.tag }}
+      upstream: ${{ steps.select.outputs.upstream }}
+      changed: ${{ steps.select.outputs.changed }}
     steps:
       - uses: actions/checkout@v4
+      - name: Detect new official stable release or integration change
+        id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
+          QUALIFIED_RELEASES: ${{ vars.MACOS_RELEASES_QUALIFIED }}
+        run: |
+          python3 -m unittest discover -s macos/tests -v
+          gh api --paginate --slurp repos/bitxeno/atvloadly/releases > "$RUNNER_TEMP/upstream.json"
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases" > "$RUNNER_TEMP/published.json"
+          python3 macos/select-release.py "$RUNNER_TEMP/upstream.json" "$RUNNER_TEMP/published.json" "$RUNNER_TEMP/upstream-notes.md"
+      - uses: actions/upload-artifact@v4
+        if: steps.select.outputs.changed == 'true'
         with:
-          fetch-depth: 0
+          name: upstream-notes
+          path: ${{ runner.temp }}/upstream-notes.md
+          retention-days: 7
+  build:
+    needs: detect
+    if: needs.detect.outputs.changed == 'true'
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.6'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
       - name: Install locked Rust compiler
         run: |
           rustup toolchain install 1.97.1 --profile minimal
           rustup default 1.97.1
-      - name: Select newest official stable release
-        id: select
+      - name: Build fresh upstream source with checked macOS patches
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 -m unittest discover -s macos/tests -v
-          gh api --paginate --slurp repos/bitxeno/atvloadly/releases > "$RUNNER_TEMP/releases-pages.json"
-          python3 -c 'import json; print(json.dumps(sum(json.load(open("'"$RUNNER_TEMP"'/releases-pages.json")), [])))' > "$RUNNER_TEMP/releases.json"
-          TAG=$(python3 macos/releases.py < "$RUNNER_TEMP/releases.json")
-          echo "UPSTREAM_TAG=$TAG" >> "$GITHUB_ENV"
-          echo "tag=macos-$TAG-candidate.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
-          echo "Selected upstream $TAG" >> "$GITHUB_STEP_SUMMARY"
-      - name: Apply macOS integration to clean upstream release
-        run: |
-          git clone --depth 1 --branch "$UPSTREAM_TAG" https://github.com/bitxeno/atvloadly.git "$RUNNER_TEMP/candidate"
-          cp -R macos "$RUNNER_TEMP/candidate/macos"
-          cd "$RUNNER_TEMP/candidate"
-          git apply --check macos/patches/backend.patch
-          git apply macos/patches/backend.patch
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: ${{ runner.temp }}/candidate/go.mod
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-      - name: Build and verify candidate
-        env:
+          UPSTREAM_TAG: ${{ needs.detect.outputs.upstream }}
           ATV_BUILD_NUMBER: ${{ github.run_number }}
-        run: |
-          cd "$RUNNER_TEMP/candidate"
-          ./macos/build.sh
+        run: ./build.sh "$UPSTREAM_TAG"
       - uses: actions/upload-artifact@v4
         with:
-          name: ATVLoadly-${{ env.UPSTREAM_TAG }}-macos-candidate
-          path: ${{ runner.temp }}/candidate/output/
+          name: macos-build
+          path: output/releases/
           retention-days: 30
-      - name: Qualification status
-        run: |
-          echo 'Candidate only. Publication is blocked until physical-device, cold-login and update rollback qualification passes, and a trusted feed is provisioned.' >> "$GITHUB_STEP_SUMMARY"
-  sign-candidate:
-    needs: candidate
+  sign-and-publish:
+    needs: [detect, build]
     runs-on: macos-15
     permissions:
       contents: write
@@ -70,22 +69,54 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          path: candidate-download
-          merge-multiple: true
-      - name: Prepare signing input
-        run: |
-          mkdir signed-candidate
-          cp candidate-download/*.zip signed-candidate/
-      - name: Sign candidate with isolated release credentials
+          name: macos-build
+          path: signed-release
+      - uses: actions/download-artifact@v4
+        with:
+          name: upstream-notes
+          path: signed-release
+      - name: Sign archive and manifest on isolated signing runner
         env:
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
-          CANDIDATE_TAG: ${{ needs.candidate.outputs.tag }}
+          RELEASE_TAG: ${{ needs.detect.outputs.tag }}
+          QUALIFIED_RELEASES: ${{ vars.MACOS_RELEASES_QUALIFIED }}
         run: |
           test -n "$SPARKLE_PRIVATE_KEY"
-          ./macos/sign-candidate.sh "$PWD/signed-candidate" "$CANDIDATE_TAG"
-      - name: Publish explicitly marked test release
+          ./macos/sign-candidate.sh "$PWD/signed-release" "$RELEASE_TAG"
+      - name: Publish versioned release
         env:
           GH_TOKEN: ${{ github.token }}
-          CANDIDATE_TAG: ${{ needs.candidate.outputs.tag }}
+          RELEASE_TAG: ${{ needs.detect.outputs.tag }}
+          QUALIFIED_RELEASES: ${{ vars.MACOS_RELEASES_QUALIFIED }}
         run: |
-          gh release create "$CANDIDATE_TAG" --prerelease --title "ATVLoadly macOS $CANDIDATE_TAG — test candidate" --notes-file macos/candidate-notes.md signed-candidate/*
+          python3 macos/publish-release.py "$RELEASE_TAG" "$PWD/signed-release"
+  record-health:
+    needs: [detect, build, sign-and-publish]
+    if: always() && needs.detect.result == 'success' && (needs.detect.outputs.changed == 'false' || needs.sign-and-publish.result == 'success')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+      - name: Record periodic successful upstream synchronization
+        env:
+          UPSTREAM_TAG: ${{ needs.detect.outputs.upstream }}
+        run: |
+          python3 - <<'PY'
+          import datetime, json, os, pathlib
+          path=pathlib.Path('.github/upstream-health.json')
+          now=datetime.datetime.now(datetime.timezone.utc)
+          previous=json.loads(path.read_text()) if path.exists() else {}
+          last=datetime.datetime.fromisoformat(previous['checked_at']) if previous.get('checked_at') else None
+          if last is None or now-last >= datetime.timedelta(days=14):
+              path.write_text(json.dumps({'checked_at':now.isoformat(),'upstream':os.environ['UPSTREAM_TAG'],'status':'release pipeline succeeded or qualified source unchanged'},indent=2)+'\n')
+          PY
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add .github/upstream-health.json
+          if ! git diff --cached --quiet; then
+            git commit -m 'chore(ci): record successful upstream synchronization'
+            git push
+          fi

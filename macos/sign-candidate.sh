@@ -4,7 +4,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ARCHIVES="${1:?archive directory required}"
 TAG="${2:?release tag required}"
 REPOSITORY="${GITHUB_REPOSITORY:-Dave8964/ATVLoadly-macOS}"
-[[ "$TAG" =~ ^macos-v[0-9]+\.[0-9]+\.[0-9]+-candidate\.[0-9]+$ ]]
+[[ "$TAG" =~ ^macos-v[0-9]+\.[0-9]+\.[0-9]+-(candidate|build)\.[0-9]+$ ]]
 [[ "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
 TOOLS="$ROOT/.build/signing-tools"
 mkdir -p "$TOOLS"
@@ -22,8 +22,12 @@ if [[ -n "${SPARKLE_PRIVATE_KEY:-}" ]]; then
  unset SPARKLE_PRIVATE_KEY
  KEY_ARGS=(--ed-key-file "$KEY_FILE")
 fi
+NOTES="$ROOT/macos/candidate-notes.md"
+if [[ "${QUALIFIED_RELEASES:-}" == true ]]; then NOTES="$ROOT/macos/release-notes.md"; fi
+cp "$NOTES" "$ARCHIVES/release-body.md"
+if [[ -f "$ARCHIVES/upstream-notes.md" ]]; then cat "$ARCHIVES/upstream-notes.md" >> "$ARCHIVES/release-body.md"; fi
 for archive in "$ARCHIVES"/*.zip; do
- cp "$ROOT/macos/candidate-notes.md" "${archive%.zip}.md"
+ cp "$ARCHIVES/release-body.md" "${archive%.zip}.md"
 done
 "$TOOLS/bin/generate_appcast" "${KEY_ARGS[@]}" --download-url-prefix "https://github.com/$REPOSITORY/releases/download/$TAG/" --release-notes-url-prefix "https://github.com/$REPOSITORY/releases/download/$TAG/" "$ARCHIVES"
 "$TOOLS/bin/sign_update" "${KEY_ARGS[@]}" --verify "$ARCHIVES/appcast.xml"
