@@ -47,7 +47,7 @@ codesign --force --sign - "$APP/Contents/Resources/bin/plumesign"
 codesign --force --sign - "$APP/Contents/Resources/bin/update-agent"
 codesign --force --sign - "$APP"
 codesign --verify --deep --strict "$APP"
-for executable in "$APP/Contents/MacOS/ATVLoadly" "$APP/Contents/Resources/bin/atvloadly" "$APP/Contents/Resources/bin/plumesign" "$APP/Contents/Resources/bin/update-agent"; do lipo -verify_arch arm64 "$executable"; done
+for executable in "$APP/Contents/MacOS/ATVLoadly" "$APP/Contents/Resources/bin/atvloadly" "$APP/Contents/Resources/bin/plumesign" "$APP/Contents/Resources/bin/update-agent"; do lipo "$executable" -verify_arch arm64; done
 python3 macos/smoke.py "$APP"
 file "$APP/Contents/Resources/bin/atvloadly" "$APP/Contents/Resources/bin/plumesign" "$APP/Contents/MacOS/ATVLoadly"
 ditto -c -k --sequesterRsrc --keepParent "$APP" "$OUT/ATVLoadly-${VERSION}-macos-arm64.zip"

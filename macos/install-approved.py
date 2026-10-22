@@ -12,7 +12,7 @@ if source==target.resolve(): raise SystemExit('Source must be a separate verifie
 if (root/'updates/pending.json').exists(): raise SystemExit('An update transaction is pending; resolve it before legacy migration.')
 subprocess.run(['/usr/bin/codesign','--verify','--deep','--strict',str(source)],check=True)
 for name in ('atvloadly','plumesign','update-agent'):
- subprocess.run(['/usr/bin/lipo','-verify_arch','arm64',str(source/'Contents/Resources/bin'/name)],check=True)
+ subprocess.run(['/usr/bin/lipo',str(source/'Contents/Resources/bin'/name),'-verify_arch','arm64'],check=True)
 with urllib.request.urlopen('http://127.0.0.1:5533/api/apps/installing',timeout=3) as response:
  state=json.load(response)
 if state.get('code')!=200 or not isinstance(state.get('data'),list) or state['data']:
