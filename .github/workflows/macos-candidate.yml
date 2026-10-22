@@ -1,0 +1,91 @@
+name: macOS upstream candidate
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '17 */6 * * *'
+permissions:
+  contents: read
+concurrency:
+  group: macos-upstream-candidate
+  cancel-in-progress: false
+jobs:
+  candidate:
+    runs-on: macos-15
+    timeout-minutes: 90
+    outputs:
+      tag: ${{ steps.select.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install locked Rust compiler
+        run: |
+          rustup toolchain install 1.97.1 --profile minimal
+          rustup default 1.97.1
+      - name: Select newest official stable release
+        id: select
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -m unittest discover -s macos/tests -v
+          gh api --paginate --slurp repos/bitxeno/atvloadly/releases > "$RUNNER_TEMP/releases-pages.json"
+          python3 -c 'import json; print(json.dumps(sum(json.load(open("'"$RUNNER_TEMP"'/releases-pages.json")), [])))' > "$RUNNER_TEMP/releases.json"
+          TAG=$(python3 macos/releases.py < "$RUNNER_TEMP/releases.json")
+          echo "UPSTREAM_TAG=$TAG" >> "$GITHUB_ENV"
+          echo "tag=macos-$TAG-candidate.${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          echo "Selected upstream $TAG" >> "$GITHUB_STEP_SUMMARY"
+      - name: Apply macOS integration to clean upstream release
+        run: |
+          git clone --depth 1 --branch "$UPSTREAM_TAG" https://github.com/bitxeno/atvloadly.git "$RUNNER_TEMP/candidate"
+          cp -R macos "$RUNNER_TEMP/candidate/macos"
+          cd "$RUNNER_TEMP/candidate"
+          git apply --check macos/patches/backend.patch
+          git apply macos/patches/backend.patch
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ runner.temp }}/candidate/go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Build and verify candidate
+        env:
+          ATV_BUILD_NUMBER: ${{ github.run_number }}
+        run: |
+          cd "$RUNNER_TEMP/candidate"
+          ./macos/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ATVLoadly-${{ env.UPSTREAM_TAG }}-macos-candidate
+          path: ${{ runner.temp }}/candidate/output/
+          retention-days: 30
+      - name: Qualification status
+        run: |
+          echo 'Candidate only. Publication is blocked until physical-device, cold-login and update rollback qualification passes, and a trusted feed is provisioned.' >> "$GITHUB_STEP_SUMMARY"
+  sign-candidate:
+    needs: candidate
+    runs-on: macos-15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: candidate-download
+          merge-multiple: true
+      - name: Prepare signing input
+        run: |
+          mkdir signed-candidate
+          cp candidate-download/*.zip signed-candidate/
+      - name: Sign candidate with isolated release credentials
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          CANDIDATE_TAG: ${{ needs.candidate.outputs.tag }}
+        run: |
+          test -n "$SPARKLE_PRIVATE_KEY"
+          ./macos/sign-candidate.sh "$PWD/signed-candidate" "$CANDIDATE_TAG"
+      - name: Publish explicitly marked test release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_TAG: ${{ needs.candidate.outputs.tag }}
+        run: |
+          gh release create "$CANDIDATE_TAG" --prerelease --title "ATVLoadly macOS $CANDIDATE_TAG — test candidate" --notes-file macos/candidate-notes.md signed-candidate/*

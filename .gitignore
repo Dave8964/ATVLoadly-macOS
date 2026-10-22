@@ -1,0 +1,9 @@
+/output/
+/upstream/
+/.build/
+**/__pycache__/
+*.key
+*.p12
+*.pfx
+*.mobileprovision
+*.pem
