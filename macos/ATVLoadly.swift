@@ -144,7 +144,7 @@ final class Controller: NSObject, NSApplicationDelegate, SPUUpdaterDelegate {
                 if process.terminationStatus != 0 { failure = String(data: data, encoding: .utf8) ?? "Update preparation failed." }
             } catch { failure = error.localizedDescription }
             DispatchQueue.main.async {
-                if let failure { self.preparingUpdate = false; self.show("Update postponed", failure); sender.reply(toApplicationShouldTerminate: false) }
+                if let failure { self.preparingUpdate = false; self.updateTarget = nil; self.show("Update postponed", failure); sender.reply(toApplicationShouldTerminate: false) }
                 else { self.preparedUpdate = true; sender.reply(toApplicationShouldTerminate: true) }
             }
         }
