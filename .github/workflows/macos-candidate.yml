@@ -21,7 +21,7 @@ jobs:
         id: select
         env:
           GH_TOKEN: ${{ github.token }}
-          QUALIFIED_RELEASES: ${{ vars.MACOS_RELEASES_QUALIFIED }}
+          QUALIFIED_RELEASES: ${{ github.ref_name == github.event.repository.default_branch && vars.MACOS_RELEASES_QUALIFIED || 'false' }}
         run: |
           python3 -m unittest discover -s macos/tests -v
           gh api --paginate --slurp repos/bitxeno/atvloadly/releases > "$RUNNER_TEMP/upstream.json"
@@ -79,7 +79,7 @@ jobs:
         env:
           SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
           RELEASE_TAG: ${{ needs.detect.outputs.tag }}
-          QUALIFIED_RELEASES: ${{ vars.MACOS_RELEASES_QUALIFIED }}
+          QUALIFIED_RELEASES: ${{ github.ref_name == github.event.repository.default_branch && vars.MACOS_RELEASES_QUALIFIED || 'false' }}
         run: |
           test -n "$SPARKLE_PRIVATE_KEY"
           ./macos/sign-candidate.sh "$PWD/signed-release" "$RELEASE_TAG"
@@ -87,7 +87,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ needs.detect.outputs.tag }}
-          QUALIFIED_RELEASES: ${{ vars.MACOS_RELEASES_QUALIFIED }}
+          QUALIFIED_RELEASES: ${{ github.ref_name == github.event.repository.default_branch && vars.MACOS_RELEASES_QUALIFIED || 'false' }}
         run: |
           python3 macos/publish-release.py "$RELEASE_TAG" "$PWD/signed-release"
   record-health:

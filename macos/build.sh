@@ -5,7 +5,7 @@ cd "$ROOT"
 [[ "$(uname -s)" = Darwin ]]
 [[ "$(uname -m)" = arm64 ]] || { echo "This build currently supports Apple Silicon only" >&2; exit 1; }
 VERSION="$(git describe --tags --exact-match HEAD)"
-PLUME_TAG="$(sed -nE 's@.*PlumeImpactor/releases/download/([^/]+)/.*@\1@p' Dockerfile | head -1)"
+PLUME_TAG="$(python3 macos/select-plume.py "$VERSION" Dockerfile)"
 [[ "$PLUME_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-patch\.[0-9]+$ ]]
 BUILD="$ROOT/.macos-build"
 OUT="$ROOT/output"
@@ -17,6 +17,10 @@ if [[ ! -d "$BUILD/PlumeImpactor/.git" ]]; then
  git clone --depth 1 --branch "$PLUME_TAG" https://github.com/bitxeno/PlumeImpactor.git "$BUILD/PlumeImpactor"
 fi
 [[ "$(git -C "$BUILD/PlumeImpactor" describe --tags --exact-match HEAD)" = "$PLUME_TAG" ]]
+if [[ "$PLUME_TAG" = v2.7.1-patch.4 ]]; then
+ [[ "$(git -C "$BUILD/PlumeImpactor" rev-parse HEAD)" = edec5b665d1d2a1dcb51a519079c2012e359dddf ]]
+ (cd "$BUILD/PlumeImpactor" && cargo test --locked -p plume_store --lib anisette_paths)
+fi
 if [[ ! -f "$BUILD/Sparkle.tar.xz" ]]; then
  curl -fL https://github.com/sparkle-project/Sparkle/releases/download/2.10.0/Sparkle-2.10.0.tar.xz -o "$BUILD/Sparkle.tar.xz"
 fi
