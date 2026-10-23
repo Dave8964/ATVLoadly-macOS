@@ -18,6 +18,14 @@ not been forced. The full normal build/sign/publish workflow passed, and stable 
 installed through the permanent feed with a healthy commit. Future compatible
 upstream releases publish automatically. Existing installations require explicit cutover approval.
 
+**Known sign-in limitation:** fresh Apple ID login can fail with SRP error
+`-80046` after two-factor verification. Successful refreshes with an existing
+account do not establish that new-account onboarding works. An official
+PlumeImpactor patch is being evaluated on the separate
+[`codex/plume-auth-patch4`](https://github.com/Dave8964/ATVLoadly-macOS/tree/codex/plume-auth-patch4)
+candidate branch; successful fresh login and app installation are not yet verified.
+Do not delete pairing data or reset all account state to work around this error.
+
 Build on an Apple Silicon Mac with Command Line Tools, Go 1.26.6, Node/npm and
 Rust 1.97.1:
 
